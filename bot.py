@@ -5,7 +5,7 @@ import asyncio
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, CallbackQueryHandler
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -21,44 +21,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("gc_bot")
 
-# Env
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 
-# Conversation states
 PHONE, OTP, PASSWORD = range(3)
 
-# Telethon user client state
+# Telethon client state
 user_client = None
 session_string = os.getenv("SESSION_STRING", "")
-
-# Stats message tracking
 stats_message = None
 stats_chat_id = None
+phone_code_hash = None
 
 
-async def ensure_connected():
-    global user_client
-    if user_client is None:
-        session = StringSession(session_string) if session_string else StringSession()
-        user_client = TelegramClient(session, API_ID, API_HASH)
-        await user_client.connect()
-    elif not user_client.is_connected():
-        try:
-            await user_client.connect()
-        except Exception:
-            user_client = None
-            return await ensure_connected()
-    return user_client
-
-
-async def is_user_authorized():
-    try:
-        client = await ensure_connected()
-        return await client.is_user_authorized()
-    except Exception:
-        return False
+async def create_client():
+    session = StringSession(session_string) if session_string else StringSession()
+    client = TelegramClient(session, API_ID, API_HASH)
+    await client.connect()
+    return client
 
 
 def stats_text():
@@ -110,18 +91,12 @@ async def update_stats_message(context):
             pass
 
 
-async def stats_callback_wrapper():
-    await update_stats_message(None)
-
-
 # --- Bot Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    authorized = await is_user_authorized()
     text = (
         "🤖 *TG GC Joiner Bot*\n\n"
         "Main Telegram groups mein auto-join karta hoon.\n\n"
-        f"*Status:* {'✅ Logged in' if authorized else '❌ Not logged in'}\n\n"
         "*Commands:*\n"
         "/login - Login with your Telegram account\n"
         "/join - Start joining groups\n"
@@ -134,10 +109,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await is_user_authorized():
-        await update.message.reply_text("✅ Already logged in. Send /join to start.")
-        return ConversationHandler.END
-
     await update.message.reply_text(
         "📱 Send your phone number with country code.\n"
         "Example: `+919876543210`",
@@ -151,8 +122,10 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = phone
 
     try:
-        client = await ensure_connected()
-        await client.send_code_request(phone)
+        client = await create_client()
+        result = await client.send_code_request(phone)
+        context.user_data["client"] = client
+        context.user_data["phone_code_hash"] = result.phone_code_hash
         await update.message.reply_text(
             "📨 OTP sent to Telegram. Send me the code.\n"
             "Example: `12345`",
@@ -167,13 +140,18 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip()
     phone = context.user_data.get("phone")
+    client = context.user_data.get("client")
+
+    if not client:
+        await update.message.reply_text("❌ Session expired. Send /login again.")
+        return ConversationHandler.END
 
     try:
-        client = await ensure_connected()
         await client.sign_in(phone=phone, code=code)
 
-        global session_string
+        global user_client, session_string
         session_string = client.session.save()
+        user_client = client
         me = await client.get_me()
         await update.message.reply_text(
             f"✅ *Logged in as* {me.first_name}!\n\n"
@@ -183,6 +161,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     except SessionPasswordNeededError:
+        context.user_data["login_client"] = client
         await update.message.reply_text(
             "🔑 2FA is enabled. Send your password.",
             parse_mode="Markdown"
@@ -201,13 +180,18 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
+    client = context.user_data.get("login_client") or context.user_data.get("client")
+
+    if not client:
+        await update.message.reply_text("❌ Session expired. Send /login again.")
+        return ConversationHandler.END
 
     try:
-        client = await ensure_connected()
         await client.sign_in(password=password)
 
-        global session_string
+        global user_client, session_string
         session_string = client.session.save()
+        user_client = client
         me = await client.get_me()
         await update.message.reply_text(
             f"✅ *Logged in as* {me.first_name}!\n\n"
@@ -221,6 +205,10 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    client = context.user_data.get("client") or context.user_data.get("login_client")
+    if client:
+        await client.disconnect()
+    context.user_data.clear()
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
@@ -228,7 +216,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global stats_message, stats_chat_id
 
-    if not await is_user_authorized():
+    if not user_client:
         await update.message.reply_text("❌ Not logged in. Send /login first.")
         return
 
@@ -258,8 +246,7 @@ async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     stats_message = msg
     stats_chat_id = update.effective_chat.id
-
-    client = await ensure_connected()
+    client = user_client
 
     async def cb():
         await update_stats_message(context)
@@ -303,7 +290,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "join":
-        if not await is_user_authorized():
+        if not user_client:
             await query.edit_message_text("❌ Not logged in. Send /login first.")
             return
         if progress.running:
@@ -327,13 +314,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text("▶️ Starting...")
 
-        client = await ensure_connected()
-
         async def cb():
             await update_stats_message(context)
 
         asyncio.create_task(run_joiner(
-            client, groups,
+            user_client, groups,
             delay_min=delay_min, delay_max=delay_max, max_joins=max_joins,
             status_callback=cb
         ))
@@ -370,7 +355,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("logout", logout_cmd))
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, button_callback))
+    app.add_handler(CallbackQueryHandler(button_callback))
 
     logger.info("Bot started. Polling...")
     app.run_polling()

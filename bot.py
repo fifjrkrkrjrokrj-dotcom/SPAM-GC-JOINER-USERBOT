@@ -38,18 +38,24 @@ stats_message = None
 stats_chat_id = None
 
 
-async def get_user_client():
+async def ensure_connected():
     global user_client
     if user_client is None:
         session = StringSession(session_string) if session_string else StringSession()
         user_client = TelegramClient(session, API_ID, API_HASH)
         await user_client.connect()
+    elif not user_client.is_connected():
+        try:
+            await user_client.connect()
+        except Exception:
+            user_client = None
+            return await ensure_connected()
     return user_client
 
 
 async def is_user_authorized():
     try:
-        client = await get_user_client()
+        client = await ensure_connected()
         return await client.is_user_authorized()
     except Exception:
         return False
@@ -145,12 +151,7 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = phone
 
     try:
-        client = await get_user_client()
-        if client.is_connected():
-            await client.disconnect()
-        user_client = None
-
-        client = await get_user_client()
+        client = await ensure_connected()
         await client.send_code_request(phone)
         await update.message.reply_text(
             "📨 OTP sent to Telegram. Send me the code.\n"
@@ -168,7 +169,7 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = context.user_data.get("phone")
 
     try:
-        client = await get_user_client()
+        client = await ensure_connected()
         await client.sign_in(phone=phone, code=code)
 
         global session_string
@@ -202,7 +203,7 @@ async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = update.message.text.strip()
 
     try:
-        client = await get_user_client()
+        client = await ensure_connected()
         await client.sign_in(password=password)
 
         global session_string
@@ -258,7 +259,7 @@ async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats_message = msg
     stats_chat_id = update.effective_chat.id
 
-    client = await get_user_client()
+    client = await ensure_connected()
 
     async def cb():
         await update_stats_message(context)
@@ -326,7 +327,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text("▶️ Starting...")
 
-        client = await get_user_client()
+        client = await ensure_connected()
 
         async def cb():
             await update_stats_message(context)
